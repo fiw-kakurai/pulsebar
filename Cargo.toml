@@ -1,0 +1,37 @@
+[package]
+name = "pulsebar"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny CPU / RAM meter overlay on the Windows 11 taskbar"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/fiw-kakurai/pulsebar"
+keywords = ["windows", "taskbar", "cpu", "memory", "monitor"]
+categories = ["visualization", "os::windows-apis"]
+
+[dependencies.windows-sys]
+version = "0.60"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+]
+
+[build-dependencies]
+embed-resource = "3"
+
+# A resident app: prioritize binary size and runtime footprint.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
