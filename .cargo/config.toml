@@ -1,0 +1,4 @@
+# Static CRT so the exe runs on machines without the VC++ Redistributable
+# (winget validation VMs are clean images without vcruntime140.dll).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
