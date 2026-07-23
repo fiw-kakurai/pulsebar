@@ -38,6 +38,49 @@ enum Mode {
     Fallback,
 }
 
+/// One widget attached to a secondary taskbar (Shell_SecondaryTrayWnd).
+/// Purely best-effort: any failure just detaches the slot and schedules a
+/// retry; it never interacts with the primary widget's mode machinery.
+struct SecondarySlot {
+    tray: HWND,
+    /// Null while detached (waiting out `cooldown`).
+    widget: HWND,
+    tooltip: HWND,
+    renderer: Option<Renderer>,
+    placement: Option<Placement>,
+    /// Ticks until the next attach attempt.
+    cooldown: u32,
+}
+
+impl SecondarySlot {
+    fn new(tray: HWND) -> SecondarySlot {
+        SecondarySlot {
+            tray,
+            widget: null_mut(),
+            tooltip: null_mut(),
+            renderer: None,
+            placement: None,
+            cooldown: 0,
+        }
+    }
+
+    fn detach(&mut self) {
+        unsafe {
+            if !self.tooltip.is_null() && IsWindow(self.tooltip) != 0 {
+                DestroyWindow(self.tooltip);
+            }
+            if !self.widget.is_null() && IsWindow(self.widget) != 0 {
+                DestroyWindow(self.widget);
+            }
+        }
+        self.tooltip = null_mut();
+        self.widget = null_mut();
+        self.renderer = None;
+        self.placement = None;
+        self.cooldown = REATTACH_INTERVAL;
+    }
+}
+
 pub struct App {
     pub hinst: HINSTANCE,
     pub manager: HWND,
@@ -50,6 +93,7 @@ pub struct App {
     reattach_countdown: u32,
     placement: Option<Placement>,
     renderer: Option<Renderer>,
+    secondary: Vec<SecondarySlot>,
     pub metrics: Metrics,
     light_theme: bool,
 }
@@ -88,6 +132,7 @@ impl App {
             reattach_countdown: 0,
             placement: None,
             renderer: None,
+            secondary: Vec::new(),
             metrics: Metrics::new(),
             light_theme: theme::system_uses_light_theme(),
         }
@@ -135,47 +180,12 @@ impl App {
         let Some(pl) = taskbar::placement_in_tray(tray, notify) else {
             return false;
         };
-        unsafe {
-            let widget = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                wide(WIDGET_CLASS).as_ptr(),
-                null(),
-                WS_POPUP,
-                0,
-                0,
-                pl.w,
-                pl.h,
-                null_mut(),
-                null_mut(),
-                self.hinst,
-                null(),
-            );
-            if widget.is_null() {
-                return false;
-            }
-            if SetParent(widget, tray).is_null() {
-                DestroyWindow(widget);
-                return false;
-            }
-            // SetParent does not rewrite styles; swap WS_POPUP for WS_CHILD by hand.
-            let style = GetWindowLongPtrW(widget, GWL_STYLE);
-            SetWindowLongPtrW(
-                widget,
-                GWL_STYLE,
-                (style & !(WS_POPUP as isize)) | WS_CHILD as isize,
-            );
-            SetWindowPos(
-                widget,
-                HWND_TOP,
-                pl.x,
-                pl.y,
-                pl.w,
-                pl.h,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            self.widget = widget;
-            self.tooltip = tooltip::create(widget, self.hinst);
+        let widget = unsafe { create_attached_widget(self.hinst, tray, &pl) };
+        if widget.is_null() {
+            return false;
         }
+        self.widget = widget;
+        self.tooltip = unsafe { tooltip::create(widget, self.hinst) };
         self.placement = Some(pl);
         self.renderer = Renderer::new(pl.w, pl.h);
         self.attach_fails = 0;
@@ -218,15 +228,85 @@ impl App {
     pub fn tick(&mut self) {
         self.metrics.sample();
         self.ensure_widget();
-        if self.widget.is_null() {
-            return;
+        if !self.widget.is_null() {
+            match self.mode {
+                Mode::Taskbar => self.sync_taskbar_placement(),
+                Mode::Fallback => self.tick_fallback(),
+            }
         }
-        match self.mode {
-            Mode::Taskbar => self.sync_taskbar_placement(),
-            Mode::Fallback => self.tick_fallback(),
-        }
+        self.sync_secondaries();
         self.render_now();
         self.update_tooltip();
+    }
+
+    /// Keep one widget per secondary taskbar, following monitors as they come
+    /// and go. Re-enumerating every tick also serves as the retry loop for
+    /// slots that failed to attach.
+    fn sync_secondaries(&mut self) {
+        let trays = taskbar::find_secondary_trays();
+        self.secondary.retain_mut(|s| {
+            if !trays.contains(&s.tray) || unsafe { IsWindow(s.tray) } == 0 {
+                s.detach();
+                return false;
+            }
+            if !s.widget.is_null() && unsafe { IsWindow(s.widget) } == 0 {
+                // The taskbar took the widget down (e.g. shell restart);
+                // keep the slot and let it re-attach after the cooldown.
+                s.detach();
+            }
+            true
+        });
+        for &tray in &trays {
+            if !self.secondary.iter().any(|s| s.tray == tray) {
+                self.secondary.push(SecondarySlot::new(tray));
+            }
+        }
+        let hinst = self.hinst;
+        for slot in &mut self.secondary {
+            if slot.widget.is_null() {
+                if slot.cooldown > 0 {
+                    slot.cooldown -= 1;
+                    continue;
+                }
+                let Some(pl) = taskbar::placement_in_secondary(slot.tray) else {
+                    slot.cooldown = REATTACH_INTERVAL;
+                    continue;
+                };
+                let widget = unsafe { create_attached_widget(hinst, slot.tray, &pl) };
+                if widget.is_null() {
+                    slot.cooldown = REATTACH_INTERVAL;
+                    continue;
+                }
+                slot.widget = widget;
+                slot.tooltip = unsafe { tooltip::create(widget, hinst) };
+                slot.renderer = Renderer::new(pl.w, pl.h);
+                slot.placement = Some(pl);
+            } else {
+                // Follow taskbar moves / DPI changes, like the primary widget.
+                let Some(pl) = taskbar::placement_in_secondary(slot.tray) else {
+                    continue;
+                };
+                if Some(pl) != slot.placement {
+                    let size_changed =
+                        slot.placement.is_none_or(|p| p.w != pl.w || p.h != pl.h);
+                    unsafe {
+                        SetWindowPos(
+                            slot.widget,
+                            HWND_TOP,
+                            pl.x,
+                            pl.y,
+                            pl.w,
+                            pl.h,
+                            SWP_NOACTIVATE,
+                        );
+                    }
+                    if size_changed {
+                        slot.renderer = Renderer::new(pl.w, pl.h);
+                    }
+                    slot.placement = Some(pl);
+                }
+            }
+        }
     }
 
     /// Detect taskbar size/position/DPI changes by comparing RECTs every tick
@@ -291,39 +371,62 @@ impl App {
     }
 
     pub fn render_now(&mut self) {
-        if self.widget.is_null() {
-            return;
-        }
         let pal = theme::palette(self.light_theme);
         let (cpu, mem) = (self.metrics.cpu_pct, self.metrics.mem_pct);
-        let dpi = self.placement.map_or(96, |p| p.dpi);
-        let ok = match self.renderer.as_mut() {
-            Some(r) => {
-                r.draw(cpu, mem, &pal, dpi);
-                r.present(self.widget)
+        if !self.widget.is_null() {
+            let dpi = self.placement.map_or(96, |p| p.dpi);
+            let ok = match self.renderer.as_mut() {
+                Some(r) => {
+                    r.draw(cpu, mem, &pal, dpi);
+                    r.present(self.widget)
+                }
+                None => false,
+            };
+            if ok {
+                self.present_fails = 0;
+            } else {
+                self.present_fails += 1;
+                // UpdateLayeredWindow on a child window is unavailable in this
+                // environment; switch to compatibility mode.
+                if self.present_fails >= MAX_ATTACH_FAILS && self.mode == Mode::Taskbar {
+                    self.mode = Mode::Fallback;
+                    self.drop_widget_state();
+                }
             }
-            None => false,
-        };
-        if ok {
-            self.present_fails = 0;
-        } else {
-            self.present_fails += 1;
-            // UpdateLayeredWindow on a child window is unavailable in this
-            // environment; switch to compatibility mode.
-            if self.present_fails >= MAX_ATTACH_FAILS && self.mode == Mode::Taskbar {
-                self.mode = Mode::Fallback;
-                self.drop_widget_state();
+        }
+        // Secondary widgets are best-effort: a failed present just detaches
+        // the slot; it retries after the cooldown instead of changing modes.
+        for slot in &mut self.secondary {
+            if slot.widget.is_null() {
+                continue;
+            }
+            let dpi = slot.placement.map_or(96, |p| p.dpi);
+            let ok = match slot.renderer.as_mut() {
+                Some(r) => {
+                    r.draw(cpu, mem, &pal, dpi);
+                    r.present(slot.widget)
+                }
+                None => false,
+            };
+            if !ok {
+                slot.detach();
             }
         }
     }
 
     fn update_tooltip(&mut self) {
-        if self.tooltip.is_null() || self.widget.is_null() {
-            return;
-        }
         let text = self.metrics.tooltip_text();
-        unsafe {
-            tooltip::update(self.tooltip, self.widget, &text);
+        if !self.tooltip.is_null() && !self.widget.is_null() {
+            unsafe {
+                tooltip::update(self.tooltip, self.widget, &text);
+            }
+        }
+        for slot in &self.secondary {
+            if !slot.tooltip.is_null() && !slot.widget.is_null() {
+                unsafe {
+                    tooltip::update(slot.tooltip, slot.widget, &text);
+                }
+            }
         }
     }
 
@@ -339,19 +442,77 @@ impl App {
         self.mode = Mode::Taskbar;
         self.attach_fails = 0;
         self.drop_widget_state();
+        // All taskbars were recreated, so every secondary slot is stale too.
+        for mut slot in self.secondary.drain(..) {
+            slot.detach();
+        }
         // TrayNotifyWnd may not exist yet right after TaskbarCreated.
         // If this attempt fails, the next tick's ensure_widget retries.
         self.ensure_widget();
     }
 
     fn on_widget_dead(&mut self) {
-        // The window itself is already gone; clean up handles and resources.
-        self.drop_widget_state();
+        // Some widget window is already gone; find which one and release its
+        // resources (the primary and each secondary are checked separately).
+        if !self.widget.is_null() && unsafe { IsWindow(self.widget) } == 0 {
+            self.drop_widget_state();
+        }
+        for slot in &mut self.secondary {
+            if !slot.widget.is_null() && unsafe { IsWindow(slot.widget) } == 0 {
+                slot.detach();
+            }
+        }
     }
 
     fn shutdown(&mut self) {
         self.drop_widget_state();
+        for mut slot in self.secondary.drain(..) {
+            slot.detach();
+        }
     }
+}
+
+/// Create the layered widget window and attach it as a child of `parent`
+/// (a taskbar window; the TrafficMonitor technique). Returns null on failure.
+unsafe fn create_attached_widget(hinst: HINSTANCE, parent: HWND, pl: &Placement) -> HWND {
+    let widget = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        wide(WIDGET_CLASS).as_ptr(),
+        null(),
+        WS_POPUP,
+        0,
+        0,
+        pl.w,
+        pl.h,
+        null_mut(),
+        null_mut(),
+        hinst,
+        null(),
+    );
+    if widget.is_null() {
+        return null_mut();
+    }
+    if SetParent(widget, parent).is_null() {
+        DestroyWindow(widget);
+        return null_mut();
+    }
+    // SetParent does not rewrite styles; swap WS_POPUP for WS_CHILD by hand.
+    let style = GetWindowLongPtrW(widget, GWL_STYLE);
+    SetWindowLongPtrW(
+        widget,
+        GWL_STYLE,
+        (style & !(WS_POPUP as isize)) | WS_CHILD as isize,
+    );
+    SetWindowPos(
+        widget,
+        HWND_TOP,
+        pl.x,
+        pl.y,
+        pl.w,
+        pl.h,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+    widget
 }
 
 pub fn register_classes(hinst: HINSTANCE) {
