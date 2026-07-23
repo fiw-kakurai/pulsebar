@@ -4,7 +4,7 @@
 #define MyAppName "Pulsebar"
 ; Overridable from the command line (CI): ISCC.exe /DMyAppVersion=x.y.z
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.2.0"
 #endif
 #define MyAppExeName "pulsebar.exe"
 #define MyAppURL "https://github.com/fiw-kakurai/pulsebar"
